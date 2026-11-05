@@ -5,7 +5,7 @@
 # Read every hit. A clean exit means none of the patterns below matched - it is
 # not proof that nothing private is in the tree.
 set -uo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 
 if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   files=$(git ls-files --cached --others --exclude-standard)

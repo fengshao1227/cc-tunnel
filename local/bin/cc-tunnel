@@ -333,7 +333,8 @@ cmd_session() {
 }
 
 cmd_tunnel() {
-  local plist="$HOME/Library/LaunchAgents/$LABEL.plist" domain="gui/$(id -u)"
+  local plist="$HOME/Library/LaunchAgents/$LABEL.plist" domain
+  domain="gui/$(id -u)"
   case "${1:-status}" in
     start)
       [[ -f "$plist" ]] || die "missing $plist - run install.sh first"
