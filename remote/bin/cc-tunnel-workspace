@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# MCP server entry on the remote host. It holds no code and runs no tools: it
+# forwards stdio to the workspace server on the local machine, through the
+# reverse tunnel, for the project this session is in.
+set -euo pipefail
+# shellcheck source=/dev/null
+. "${CC_TUNNEL_REMOTE_ENV:-$HOME/.config/cc-tunnel/remote.env}"
+
+# The agent starts MCP servers in its project directory, so $PWD is what the
+# router maps to a local root. %q keeps a path with spaces in one piece through
+# the local machine's login shell.
+exec ssh -F "$HOME/.ssh/config" cc-tunnel-mac \
+  "$(printf '%q' "$CC_TUNNEL_MAC_BIN/cc-tunnel-router") --remote-root $(printf '%q' "$PWD")"

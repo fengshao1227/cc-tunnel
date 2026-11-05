@@ -1,0 +1,15 @@
+## cc-tunnel: when the source is not on this machine
+
+When the `cc-tunnel-workspace` MCP tools (`workspace_*`) are available in a
+session, that project's source is on the user's local machine, not here. The
+directory this session runs in is a stub that holds rules and memory only.
+
+- Read, search, edit, build, test and run git through the `workspace_*` tools.
+  Do not use the built-in file tools or a shell here for project source: they
+  see an empty stub and produce answers that look right and are not.
+- Call `workspace_status` first. The `cc-tunnel-workspace` skill has the rest.
+- If the workspace tools are missing or failing, say so and follow the
+  `cc-tunnel-doctor` skill. Never fall back to working on this host.
+- After an interruption or a timeout, report a command's result as unknown.
+  Do not repeat a side effect, such as a push, migration or deploy, on your own:
+  check first whether it already happened.

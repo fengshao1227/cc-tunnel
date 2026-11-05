@@ -1,0 +1,51 @@
+# cc-tunnel configuration. Sourced by bash, so plain KEY=value lines.
+# Lives at ~/.config/cc-tunnel/config; keep it 0600.
+
+# ---- the remote host that runs the agent ---------------------------------
+
+# A hostname, or a Host alias from ~/.ssh/config. With an alias you can keep
+# Port, IdentityFile, BindInterface and friends there and leave the optional
+# fields below empty.
+CC_TUNNEL_REMOTE_HOST=vps.example.com
+
+# The agent's own account on that host. Not root: see docs/security.md.
+CC_TUNNEL_REMOTE_USER=agent
+
+# Optional. Empty means "use ~/.ssh/config or ssh's defaults".
+CC_TUNNEL_REMOTE_PORT=
+CC_TUNNEL_REMOTE_KEY=~/.ssh/cc-tunnel_remote
+
+# Where project stubs live on the remote host (absolute path, no spaces).
+# Default: /home/$CC_TUNNEL_REMOTE_USER/projects
+CC_TUNNEL_REMOTE_PROJECTS=
+
+# ---- the reverse tunnel (this machine dials out) ---------------------------
+
+# A separate, forward-only account on the remote host (scripts/vps-bootstrap.sh
+# creates it). Its key cannot open a shell.
+CC_TUNNEL_TUNNEL_USER=cc-tunnel-link
+CC_TUNNEL_TUNNEL_KEY=~/.ssh/cc-tunnel_tunnel
+
+# The remote host reaches this machine at 127.0.0.1:<port>. One port per
+# machine: two machines cannot share one tunnel port.
+CC_TUNNEL_TUNNEL_PORT=22022
+
+# ---- optional ----------------------------------------------------------------
+
+# The agent command on the remote host.
+# CC_TUNNEL_AGENT=claude
+
+# Extra ssh options for cc-tunnel and the tunnel. On a machine with a TUN-mode
+# proxy (Clash, sing-box, ...), binding to the real interface keeps ssh out of
+# the proxy's userspace TCP stack - see docs/troubleshooting.md.
+# CC_TUNNEL_SSH_OPTS="-o BindInterface=en0"
+
+# Where memory is shared with agents on this machine (Codex, local Claude).
+# CC_TUNNEL_SHARED_DIR=~/.config/ai-context
+
+# Extra file names the workspace file tools refuse, comma-separated globs.
+# The defaults already cover .env*, .netrc, .npmrc, .git-credentials and keys.
+# CC_TUNNEL_SENSITIVE=".aws,*.pem"
+
+# Extra PATH entries for commands run through workspace_exec.
+# CC_TUNNEL_EXEC_PATH=/opt/homebrew/opt/node@22/bin

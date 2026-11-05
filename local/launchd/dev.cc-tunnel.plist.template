@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Rendered by install.sh. launchd does not expand ~ or $HOME, so every path
+     here is absolute. Load it with `cc-tunnel tunnel start`. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@LABEL@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@BIN@/cc-tunnel-link</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <!-- Restart whenever the tunnel exits: a dropped link, a reboot of the
+       remote host, or the 90 s ServerAlive bound firing. -->
+  <key>KeepAlive</key>
+  <true/>
+  <!-- Measured: after kill -9 of the tunnel, launchd had a new one up in 14 s. -->
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>@LOG_DIR@/tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>@LOG_DIR@/tunnel.err</string>
+</dict>
+</plist>

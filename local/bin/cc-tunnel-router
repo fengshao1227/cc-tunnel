@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Map the remote agent's working directory to a local project root, then start
+# the workspace MCP server on it.
+#
+# Invoked over the reverse tunnel by the remote wrapper:
+#   cc-tunnel-router --remote-root /home/agent/projects/app/sub
+#
+# The longest mapped remote prefix wins, so a mapping for .../app/sub beats one
+# for .../app. Whatever follows the prefix is appended to the local root, which
+# is how a remote session started in a subdirectory lands in the same
+# subdirectory here.
+set -euo pipefail
+
+CONFIG_DIR=${CC_TUNNEL_CONFIG_DIR:-$HOME/.config/cc-tunnel}
+MAP="$CONFIG_DIR/projects.conf"
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+
+die() { echo "cc-tunnel-router: $*" >&2; exit 1; }
+
+remote_root=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --remote-root) remote_root=${2:-}; shift 2 ;;
+    *) echo "usage: cc-tunnel-router --remote-root <remote dir>" >&2; exit 2 ;;
+  esac
+done
+[[ -n "$remote_root" ]] || die "missing --remote-root"
+[[ -r "$MAP" ]] || die "missing $MAP"
+
+# The config may set CC_TUNNEL_SENSITIVE / CC_TUNNEL_EXEC_PATH for the server.
+if [[ -r "$CONFIG_DIR/config" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$CONFIG_DIR/config"
+  set +a
+fi
+
+best_remote=''
+best_local=''
+while IFS='|' read -r local_root mapped_remote _rest || [[ -n "${local_root:-}" ]]; do
+  [[ -n "${local_root:-}" && "$local_root" != \#* ]] || continue
+  mapped_remote=${mapped_remote%$'\r'}
+  [[ -n "$mapped_remote" ]] || continue
+  case "$remote_root" in
+    "$mapped_remote"|"$mapped_remote"/*)
+      if [[ ${#mapped_remote} -gt ${#best_remote} ]]; then
+        best_remote=$mapped_remote
+        best_local=$local_root
+      fi
+      ;;
+  esac
+done < "$MAP"
+
+[[ -n "$best_remote" ]] || die "unmapped remote directory: $remote_root (add it with \`cc-tunnel map\` on this machine)"
+
+relative=${remote_root#"$best_remote"}
+# The remainder is appended to a local path, so `..` in it would walk out of
+# the mapped root before the server ever saw it. Refuse rather than normalise:
+# a well-behaved agent never sends one.
+case "/$relative/" in
+  */../*|*/./*) die "refusing a remote path with . or .. segments: $remote_root" ;;
+esac
+
+exec "${CC_TUNNEL_MCP_BIN:-$BIN_DIR/cc-tunnel-mcp}" --root "${best_local}${relative}"

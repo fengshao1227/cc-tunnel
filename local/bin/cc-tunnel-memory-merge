@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""Merge a memory index (MEMORY.md) by entry instead of by file timestamp.
+
+usage: cc-tunnel-memory-merge <memory-dir> <index> [<index> ...]
+
+`rsync --update` takes the newer MEMORY.md whole, so entries the other machine
+added between syncs would vanish without a trace. This merges per memory:
+
+- The newest index is kept as written. An entry line may link one memory or
+  several (`- group: [a](a.md) · [b](b.md)`); either way it covers every memory
+  it links.
+- A one-memory line for a memory a grouped line already covers is dropped, so a
+  grouped index is not padded back out to one line per memory.
+- An older index contributes only memories the newest one links nowhere.
+- A memory file linked nowhere gets a line built from its own frontmatter, so
+  it cannot stay invisible.
+- A link to a memory that no longer exists is removed; a line left with no
+  links is dropped.
+
+The result is written to <memory-dir>/MEMORY.md. Python 3.6+, standard library.
+"""
+import io
+import os
+import re
+import sys
+
+# Link text must not contain "]": a title like "[Mono]" inside the brackets
+# makes the link unreadable here, and the merge then re-adds the memory as a
+# duplicate line on every run. Fix the link text, not the copies.
+LINK = re.compile(r'\[[^\]]*\]\(([A-Za-z0-9._-]+\.md)\)')
+ENTRY = re.compile(r'^\s*[-*] ')
+DESC = re.compile(r'^description:\s*(.+)$', re.M)
+TITLE = re.compile(r'^#\s+(.+)$', re.M)
+SEPARATOR = r'\s*·\s*'
+
+
+def read(path):
+    try:
+        return io.open(path, encoding='utf-8').read()
+    except Exception:
+        return ''
+
+
+def generated_line(directory, slug):
+    body = read(os.path.join(directory, slug))
+    title = TITLE.search(body)
+    desc = DESC.search(body)
+    label = title.group(1).strip() if title else slug[:-3].replace('-', ' ')
+    tail = ' — ' + desc.group(1).strip().strip('"') if desc else ''
+    return '- [%s](%s)%s' % (label, slug, tail)
+
+
+def entry_slugs(line):
+    if not ENTRY.match(line):
+        return []
+    return [slug for slug in LINK.findall(line) if slug != 'MEMORY.md']
+
+
+def without_dead_links(line, present):
+    slugs = entry_slugs(line)
+    dead = [slug for slug in slugs if slug not in present]
+    if not dead:
+        return line
+    if len(dead) == len(slugs):
+        return None
+    for slug in dead:
+        link = r'\[[^\]]*\]\(' + re.escape(slug) + r'\)'
+        # Take one neighbouring separator with the link, so no "· ·" is left.
+        line, count = re.subn(SEPARATOR + link, '', line, count=1)
+        if not count:
+            line = re.sub(link + SEPARATOR, '', line, count=1)
+            line = re.sub(link, '', line, count=1)
+    return line
+
+
+def main():
+    if len(sys.argv) < 3:
+        sys.exit('usage: cc-tunnel-memory-merge <memory-dir> <index> [<index> ...]')
+    directory = sys.argv[1]
+    candidates = sorted((p for p in sys.argv[2:] if os.path.isfile(p)), key=os.path.getmtime)
+    if not candidates:
+        return
+    present = {n for n in os.listdir(directory) if n.endswith('.md') and n != 'MEMORY.md'}
+
+    newest = [raw.rstrip() for raw in read(candidates[-1]).splitlines()]
+    grouped = set()
+    for raw in newest:
+        slugs = entry_slugs(raw)
+        if len(slugs) > 1:
+            grouped.update(slugs)
+
+    out, covered = [], set()
+    for raw in newest:
+        slugs = entry_slugs(raw)
+        if not slugs:
+            out.append(raw)
+            continue
+        if len(slugs) == 1 and slugs[0] in grouped:
+            continue
+        line = without_dead_links(raw, present)
+        if line is None:
+            continue
+        out.append(line)
+        covered.update(slug for slug in slugs if slug in present)
+
+    extra = []
+    for path in reversed(candidates[:-1]):
+        for raw in read(path).splitlines():
+            slugs = [slug for slug in entry_slugs(raw) if slug in present]
+            new = [slug for slug in slugs if slug not in covered]
+            if not new:
+                continue
+            if len(slugs) == 1:
+                extra.append(raw.rstrip())
+            else:
+                extra.extend(generated_line(directory, slug) for slug in new)
+            covered.update(new)
+    for slug in sorted(present - covered):
+        extra.append(generated_line(directory, slug))
+        covered.add(slug)
+
+    while out and not out[-1].strip():
+        out.pop()
+    text = '\n'.join(out + extra) + '\n'
+    io.open(os.path.join(directory, 'MEMORY.md'), 'w', encoding='utf-8').write(text)
+    print('cc-tunnel-memory-merge: %d lines, %d memories, %d added'
+          % (len(out) + len(extra), len(present), len(extra)))
+
+
+if __name__ == '__main__':
+    main()

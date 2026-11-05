@@ -1,0 +1,468 @@
+#!/usr/bin/env bash
+# cc-tunnel: run a coding agent on a remote host against code that stays here.
+#
+# The remote host keeps the agent process, its model traffic, its memory and
+# its session history. The source stays on this machine, and the agent reaches
+# it through the cc-tunnel-workspace MCP server over a reverse SSH tunnel. There
+# is no copy of the code on the remote host to go stale.
+set -euo pipefail
+
+VERSION=0.1.0
+CONFIG_DIR=${CC_TUNNEL_CONFIG_DIR:-$HOME/.config/cc-tunnel}
+MAP="$CONFIG_DIR/projects.conf"
+BIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+SHARE=${CC_TUNNEL_SHARE:-$HOME/.local/share/cc-tunnel}
+
+die() { printf 'cc-tunnel: %b\n' "$*" >&2; exit 1; }
+note() { printf 'cc-tunnel: %s\n' "$*" >&2; }
+q() { printf '%q' "$1"; }
+# Claude Code's name for a project's records directory: every non-alphanumeric
+# character becomes '-'.
+encode() { printf '%s' "$1" | LC_ALL=C sed 's/[^a-zA-Z0-9]/-/g'; }
+
+usage() {
+  cat <<'USAGE'
+cc-tunnel - run a coding agent remotely against code that stays on this machine
+
+  cc-tunnel [agent args]        open the agent in the mapped remote project
+                               (memory and rules are synced first; --no-sync skips it)
+  cc-tunnel -r                  the same, with the agent's resume picker
+  cc-tunnel map [name]          map the current directory to <remote projects>/<name>
+  cc-tunnel mappings            list mappings
+  cc-tunnel check               test mapping, SSH, tunnel and the workspace MCP end to end
+  cc-tunnel sync                merge memory and push project rules to the remote stub
+  cc-tunnel session [count]     summarise the latest remote session (default 24 turns)
+  cc-tunnel tunnel <cmd>        start | stop | restart | status | logs
+  cc-tunnel remote-setup [--yes] [--with-codegraph] [--with-fast-context]
+                               install or update the remote side
+  cc-tunnel version
+
+The current directory selects the project. Config: ~/.config/cc-tunnel/config
+USAGE
+}
+
+# ---- config ---------------------------------------------------------------
+
+if [[ -r "$CONFIG_DIR/config" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$CONFIG_DIR/config"
+  set +a
+fi
+
+AGENT=${CC_TUNNEL_AGENT:-claude}
+TUNNEL_PORT=${CC_TUNNEL_TUNNEL_PORT:-22022}
+SHARED_DIR=${CC_TUNNEL_SHARED_DIR:-$HOME/.config/ai-context}
+LABEL=${CC_TUNNEL_LAUNCHD_LABEL:-dev.cc-tunnel}
+REMOTE_PROJECTS=${CC_TUNNEL_REMOTE_PROJECTS:-}
+if [[ -z "$REMOTE_PROJECTS" && -n "${CC_TUNNEL_REMOTE_USER:-}" ]]; then
+  REMOTE_PROJECTS="/home/$CC_TUNNEL_REMOTE_USER/projects"
+fi
+
+TARGET=''
+if [[ -n "${CC_TUNNEL_REMOTE_HOST:-}" ]]; then
+  TARGET="${CC_TUNNEL_REMOTE_USER:+$CC_TUNNEL_REMOTE_USER@}$CC_TUNNEL_REMOTE_HOST"
+fi
+
+# ServerAlive* is the guard against a remote that finishes the handshake and
+# authenticates, then never starts a session (out of CPU, or stuck in a
+# shutdown that cannot complete). Without it every command below hangs forever
+# instead of failing, and ConnectTimeout does not help - the TCP connect
+# succeeded.
+#
+# Two minutes, not thirty seconds. The connection below is shared, so ending it
+# ends whatever rsync is riding it: at 10 s x 3 a loaded server that went quiet
+# for half a minute killed a running sync with "unexpected end of file". The
+# bound exists to turn an unbounded hang into an error, and 120 s does that
+# while still letting a slow box finish a transfer. Do not tighten it.
+SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
+# The interactive session is mostly idle and must survive a network blip.
+SSH_TTY_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new
+  -o ServerAliveInterval=30 -o ServerAliveCountMax=6)
+# Only what is configured is passed: an ssh_config Host alias keeps its own
+# Port, IdentityFile, BindInterface and so on instead of being overridden.
+if [[ -n "${CC_TUNNEL_REMOTE_PORT:-}" ]]; then
+  SSH_OPTS+=(-p "$CC_TUNNEL_REMOTE_PORT"); SSH_TTY_OPTS+=(-p "$CC_TUNNEL_REMOTE_PORT")
+fi
+if [[ -n "${CC_TUNNEL_REMOTE_KEY:-}" ]]; then
+  key=${CC_TUNNEL_REMOTE_KEY/#\~/$HOME}
+  SSH_OPTS+=(-i "$key" -o IdentitiesOnly=yes); SSH_TTY_OPTS+=(-i "$key" -o IdentitiesOnly=yes)
+fi
+if [[ -n "${CC_TUNNEL_SSH_OPTS:-}" ]]; then
+  read -r -a extra_opts <<< "$CC_TUNNEL_SSH_OPTS"
+  SSH_OPTS+=("${extra_opts[@]}"); SSH_TTY_OPTS+=("${extra_opts[@]}")
+fi
+# One handshake serves every command and rsync below; a launch used to open a
+# dozen connections, each its own chance to fail on a busy server. rsync takes
+# these options as one string, so multiplexing is skipped if the socket
+# directory would contain a space.
+CONTROL_DIR=${CC_TUNNEL_CONTROL_DIR:-$HOME/.ssh/cc-tunnel-cm}
+if [[ "$CONTROL_DIR" != *" "* ]] && mkdir -p "$CONTROL_DIR" 2>/dev/null; then
+  chmod 700 "$CONTROL_DIR" 2>/dev/null || true
+  SSH_OPTS+=(-o ControlMaster=auto -o "ControlPath=$CONTROL_DIR/%C" -o ControlPersist=120)
+  SSH_TTY_OPTS+=(-o ControlMaster=auto -o "ControlPath=$CONTROL_DIR/%C" -o ControlPersist=120)
+fi
+SSH_E="ssh ${SSH_OPTS[*]}"
+
+# Memory is .md only. Transcripts and per-session directories live beside it in
+# the records directory and must never be copied around: they hold the whole
+# conversation, including anything pasted into it.
+MEMORY_FILTER=(--include='*.md' --exclude='*')
+
+require_remote() {
+  [[ -n "$TARGET" ]] || die "set CC_TUNNEL_REMOTE_HOST in $CONFIG_DIR/config"
+}
+
+# ---- ssh --------------------------------------------------------------------
+
+# 255 is ssh's own "I could not carry your command", not an answer from the
+# remote command, and on a loaded server it is usually transient. Retry only
+# that; any other status is the remote command's real answer and is passed
+# back untouched, so `test -d` returning 1 still means "missing".
+ssh_do() {
+  local attempt=1 status
+  while :; do
+    status=0
+    ssh "${SSH_OPTS[@]}" "$TARGET" "$@" || status=$?
+    [[ "$status" -eq 0 ]] && return 0
+    [[ "$status" -ne 255 ]] && return "$status"
+    [[ "$attempt" -ge 3 ]] && return 255
+    note "no answer from $TARGET (attempt $attempt of 3), retrying in $(( attempt * 4 ))s"
+    sleep $(( attempt * 4 ))
+    attempt=$(( attempt + 1 ))
+  done
+}
+
+# Unreachable and wedged need opposite responses, so say which one it is. An
+# unreachable host is a network question; a host whose sshd answers but starts
+# no session is wedged, and a graceful reboot of it will hang too.
+diagnose_ssh() {
+  local host port banner
+  host=$(ssh -G "${SSH_OPTS[@]}" "$TARGET" 2>/dev/null | awk '$1=="hostname"{print $2; exit}')
+  port=$(ssh -G "${SSH_OPTS[@]}" "$TARGET" 2>/dev/null | awk '$1=="port"{print $2; exit}')
+  if ! command -v nc >/dev/null 2>&1 || [[ -z "$host" ]]; then
+    note "ssh failed and the cause could not be narrowed down (no nc, or host unresolved)"
+    return 0
+  fi
+  if ! nc -z -G 8 "$host" "$port" >/dev/null 2>&1; then
+    note "cannot reach $host:$port at all - host down, network, or firewall"
+    return 0
+  fi
+  banner=$( (sleep 4 | nc -w 6 "$host" "$port") 2>/dev/null | head -1 | tr -d '\r' )
+  if [[ -z "$banner" ]]; then
+    note "port $port is open but sends no SSH banner - sshd is not answering"
+    return 0
+  fi
+  note "sshd answers ($banner) but no session starts - the host is wedged, not unreachable"
+  note "check its load and for a stuck shutdown; a graceful reboot may hang, use the provider's force reset"
+}
+
+# ---- mapping ----------------------------------------------------------------
+
+current_dir=$(pwd -P)
+best_local='' best_remote='' best_records='' remote_dir=''
+
+if [[ -r "$MAP" ]]; then
+  while IFS='|' read -r local_root remote_root records_root || [[ -n "${local_root:-}" ]]; do
+    [[ -n "${local_root:-}" && "$local_root" != \#* ]] || continue
+    remote_root=${remote_root%$'\r'}
+    records_root=${records_root%$'\r'}
+    [[ -n "$remote_root" ]] || continue
+    case "$current_dir" in
+      "$local_root"|"$local_root"/*)
+        if [[ ${#local_root} -gt ${#best_local} ]]; then
+          best_local=$local_root best_remote=$remote_root best_records=$records_root
+        fi
+        ;;
+    esac
+  done < "$MAP"
+fi
+if [[ -n "$best_local" ]]; then
+  remote_dir="${best_remote}${current_dir#"$best_local"}"
+fi
+
+require_mapping() {
+  [[ -n "$remote_dir" ]] || die "this directory is not mapped: $current_dir\nRun \`cc-tunnel map\` in the project root first."
+}
+
+# ---- commands ---------------------------------------------------------------
+
+cmd_map() {
+  local name=${1:-${current_dir##*/}} remote line other
+  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || die "project name must match [A-Za-z0-9._-]+: $name"
+  [[ "$REMOTE_PROJECTS" == /* ]] || die "set CC_TUNNEL_REMOTE_PROJECTS (an absolute path) in $CONFIG_DIR/config"
+  remote="$REMOTE_PROJECTS/$name"
+  mkdir -p "$CONFIG_DIR"
+  touch "$MAP"
+  while IFS='|' read -r local_root remote_root _ || [[ -n "${local_root:-}" ]]; do
+    [[ -n "${local_root:-}" && "$local_root" != \#* ]] || continue
+    remote_root=${remote_root%$'\r'}
+    if [[ "$local_root" == "$current_dir" ]]; then
+      echo "already mapped: $local_root -> $remote_root"
+      return 0
+    fi
+    # Two local trees behind one remote directory would share its memory and
+    # sessions, and the router could only ever pick one of them.
+    [[ "$remote_root" == "$remote" ]] && other=$local_root
+  done < "$MAP"
+  [[ -z "${other:-}" ]] || die "$remote is already mapped to $other\nPick another name: cc-tunnel map <name>"
+  if [[ -n "$best_local" && "$best_local" != "$current_dir" ]]; then
+    note "note: this is inside the mapped root $best_local; the longer mapping wins here"
+  fi
+  line="$current_dir|$remote"
+  printf '%s\n' "$line" >> "$MAP"
+  echo "mapped $current_dir -> $remote"
+}
+
+cmd_mappings() {
+  [[ -r "$MAP" ]] || { echo "(no mappings yet: run \`cc-tunnel map\` in a project root)"; return 0; }
+  sed '/^[[:space:]]*#/d; /^[[:space:]]*$/d' "$MAP" | awk -F'|' '{printf "%s\n  -> %s\n", $1, $2}'
+}
+
+report_freshness() {
+  local dir=$1 name branch ahead behind stale=''
+  name=${dir##*/}
+  branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null) || return 0
+  if ! git -C "$dir" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+    printf 'git %s: %s, no upstream - nothing off this machine holds it\n' "$name" "$branch"
+    return 0
+  fi
+  # Without a fetch these counts come from a ref that may be weeks old, and a
+  # stale checkout reports itself up to date. An https remote fails here for
+  # want of a TTY under non-interactive ssh - the usual cause.
+  git -C "$dir" fetch --quiet 2>/dev/null || stale=' [fetch failed: counts may be stale; is the remote https?]'
+  ahead=$(git -C "$dir" rev-list --count '@{u}..HEAD' 2>/dev/null || echo '?')
+  behind=$(git -C "$dir" rev-list --count 'HEAD..@{u}' 2>/dev/null || echo '?')
+  printf 'git %s: %s, behind %s, ahead %s%s\n' "$name" "$branch" "$behind" "$ahead" "$stale"
+}
+
+cmd_check() {
+  local status=0 probe child
+  require_mapping
+  require_remote
+  printf 'local   %s\nremote  %s:%s\n' "$current_dir" "$TARGET" "$remote_dir"
+  if [[ -d "$best_local/.codegraph" ]]; then
+    echo "codegraph indexed"
+  fi
+  if [[ -d "$best_local/.git" ]]; then
+    report_freshness "$best_local"
+  else
+    for child in "$best_local"/*/; do
+      [[ -d "$child/.git" ]] && report_freshness "${child%/}"
+    done
+  fi
+  ssh_do true || status=$?
+  if [[ "$status" -ne 0 ]]; then
+    echo "remote  unreachable"
+    diagnose_ssh
+    return 1
+  fi
+  echo "remote  ssh ok"
+  ssh_do "bash -lc $(q "command -v $AGENT >/dev/null && $AGENT --version || echo '$AGENT not found on PATH'")" \
+    | sed 's/^/agent   /'
+  # The one probe that exercises everything: remote wrapper, remote ssh config,
+  # tunnel, the key on this machine, router mapping and the server starting.
+  # It runs from the project directory, as the agent would - the wrapper maps
+  # its working directory - so the wrapper is named by absolute path.
+  probe=$(ssh_do "mkdir -p $(q "$remote_dir") && cd $(q "$remote_dir") && printf '%s\n' \
+    '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}' \
+    | timeout 30 \"\$HOME/.local/share/cc-tunnel/bin/cc-tunnel-workspace\" 2>&1 | head -5" 2>&1) || true
+  if [[ "$probe" == *'"serverInfo"'* ]]; then
+    echo "mcp     workspace server answers through the tunnel"
+  else
+    echo "mcp     FAILED end to end:"
+    printf '%s\n' "$probe" | sed 's/^/        /'
+    echo "        see docs/troubleshooting.md, or run: cc-tunnel tunnel status"
+    return 1
+  fi
+}
+
+cmd_sync() {
+  local project records shared slot tmp rule
+  require_mapping
+  require_remote
+  project=${best_remote##*/}
+  records=${best_records:-$HOME/.claude/projects/$(encode "$best_local")}
+  shared="$SHARED_DIR/projects/$project/memory"
+  # Relative remote paths are relative to the remote user's home, for both
+  # ssh and rsync, so the remote home never has to be looked up.
+  slot=".claude/projects/$(encode "$best_remote")/memory"
+  mkdir -p "$records/memory" "$shared"
+  if ! ssh_do "mkdir -p $(q "$slot") $(q "$best_remote")"; then
+    diagnose_ssh
+    die "could not prepare the remote directories; nothing was synced"
+  fi
+  tmp=$(mktemp -d)
+  # Gather: local records and the remote slot into the shared copy. --update
+  # keeps the newer of two files with the same name.
+  rsync -az --update "${MEMORY_FILTER[@]}" "$records/memory/" "$shared/"
+  rsync -az --update "${MEMORY_FILTER[@]}" -e "$SSH_E" "$TARGET:$slot/" "$shared/" 2>/dev/null || true
+  # --update takes the newer MEMORY.md whole, which silently drops entries the
+  # other side added since the last sync. Fetch the remote index on its own so
+  # the merge sees every version.
+  rsync -az -e "$SSH_E" "$TARGET:$slot/MEMORY.md" "$tmp/remote-MEMORY.md" 2>/dev/null || true
+  "$BIN_DIR/cc-tunnel-memory-merge" "$shared" "$shared/MEMORY.md" "$records/memory/MEMORY.md" \
+    "$tmp/remote-MEMORY.md" >&2 || true
+  rm -rf "$tmp"
+  # Publish the merged set back to both sides.
+  rsync -az --update "${MEMORY_FILTER[@]}" "$shared/" "$records/memory/"
+  rsync -az --update "${MEMORY_FILTER[@]}" -e "$SSH_E" "$shared/" "$TARGET:$slot/"
+  for rule in AGENTS.md CLAUDE.md; do
+    if [[ -f "$best_local/$rule" ]]; then
+      rsync -az -e "$SSH_E" "$best_local/$rule" "$TARGET:$best_remote/$rule"
+    fi
+  done
+  if [[ -f "$best_local/.claude/CLAUDE.md" ]]; then
+    ssh_do "mkdir -p $(q "$best_remote/.claude")"
+    rsync -az -e "$SSH_E" "$best_local/.claude/CLAUDE.md" "$TARGET:$best_remote/.claude/CLAUDE.md"
+  fi
+  printf 'project=%s\nshared=%s\nremote-slot=~/%s\n' "$project" "$shared" "$slot"
+}
+
+cmd_session() {
+  local count=${1:-24} slot
+  [[ "$count" =~ ^[0-9]+$ ]] || die "session count must be a number"
+  require_mapping
+  require_remote
+  slot=".claude/projects/$(encode "$best_remote")"
+  ssh_do "f=\$(ls -t $(q "$slot")/*.jsonl 2>/dev/null | head -1)
+    [ -n \"\$f\" ] || { echo 'no remote sessions recorded for this project yet' >&2; exit 3; }
+    echo \"#file \$(basename \"\$f\")\"
+    tail -n 8000 \"\$f\"" | "$BIN_DIR/cc-tunnel-session" "$count"
+}
+
+cmd_tunnel() {
+  local plist="$HOME/Library/LaunchAgents/$LABEL.plist" domain="gui/$(id -u)"
+  case "${1:-status}" in
+    start)
+      [[ -f "$plist" ]] || die "missing $plist - run install.sh first"
+      launchctl bootstrap "$domain" "$plist" 2>/dev/null || launchctl kickstart -k "$domain/$LABEL"
+      echo "tunnel started (launchd keeps it alive)"
+      ;;
+    stop)
+      launchctl bootout "$domain/$LABEL" 2>/dev/null || true
+      echo "tunnel stopped"
+      ;;
+    restart) cmd_tunnel stop; cmd_tunnel start ;;
+    status)
+      if launchctl print "$domain/$LABEL" >/dev/null 2>&1; then
+        launchctl print "$domain/$LABEL" | awk '/^\t(state|pid|last exit code) =/{sub(/^\t/,""); print}'
+      else
+        echo "launchd job $LABEL is not loaded (cc-tunnel tunnel start)"
+      fi
+      local pid found=0
+      for pid in $(pgrep -x ssh 2>/dev/null); do
+        if ps -o command= -p "$pid" | grep -q -- "-R 127.0.0.1:${TUNNEL_PORT}:"; then
+          echo "tunnel  up (ssh pid $pid, remote 127.0.0.1:$TUNNEL_PORT -> here)"; found=1
+        fi
+      done
+      [[ "$found" -eq 1 ]] || echo "tunnel  down"
+      ;;
+    logs)
+      tail -n 50 "$HOME/Library/Logs/cc-tunnel/tunnel.err" 2>/dev/null || true
+      tail -n 50 "$HOME/Library/Logs/cc-tunnel/tunnel.log" 2>/dev/null || true
+      ;;
+    *) die "usage: cc-tunnel tunnel start|stop|restart|status|logs" ;;
+  esac
+}
+
+# Toolchain directories a non-interactive ssh session on this machine would
+# not have on PATH: wherever node, npx, codegraph and rg live here now.
+mac_path() {
+  local dirs=(/opt/homebrew/bin /usr/local/bin) tool dir out=''
+  for tool in node npx codegraph rg; do
+    dir=$(command -v "$tool" 2>/dev/null) && dirs+=("$(dirname "$dir")")
+  done
+  for dir in "${dirs[@]}"; do
+    [[ ":$out:" == *":$dir:"* ]] || out=${out:+$out:}$dir
+  done
+  printf '%s' "$out"
+}
+
+authorize_remote_key() {
+  local pubkey=$1 yes=$2 line material answer
+  [[ -n "$pubkey" ]] || { note "the remote installer printed no public key; nothing to authorize"; return 0; }
+  material=$(awk '{print $2}' <<< "$pubkey")
+  if grep -qF "$material" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+    echo "local   remote key already authorized"
+    return 0
+  fi
+  # restrict: no pty, no forwarding, no agent. from=: the key only works when
+  # the connection comes through the tunnel, which arrives from localhost.
+  line="restrict,from=\"127.0.0.1,::1\" $pubkey"
+  if [[ "$yes" != 1 ]]; then
+    printf 'Authorize the remote host to reach this machine through the tunnel?\n'
+    printf 'This appends one restricted line to ~/.ssh/authorized_keys:\n  %s\n[y/N] ' "$line"
+    read -r answer
+    if [[ "$answer" != [yY]* ]]; then
+      note "skipped; add that line yourself when ready"
+      return 0
+    fi
+  fi
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  printf '%s\n' "$line" >> "$HOME/.ssh/authorized_keys"
+  chmod 600 "$HOME/.ssh/authorized_keys"
+  echo "local   remote key authorized (restricted to connections through the tunnel)"
+}
+
+cmd_remote_setup() {
+  local yes=0 flags=() output pubkey
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --yes|-y) yes=1 ;;
+      --with-codegraph|--with-fast-context) flags+=("$1") ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
+  require_remote
+  [[ -d "$SHARE/remote" && -d "$SHARE/skills" ]] || die "missing $SHARE/{remote,skills} - run install.sh first"
+  ssh_do "mkdir -p .local/share/cc-tunnel/stage" || { diagnose_ssh; die "cannot reach $TARGET"; }
+  rsync -az --delete -e "$SSH_E" "$SHARE/remote/" "$TARGET:.local/share/cc-tunnel/stage/remote/"
+  rsync -az --delete -e "$SSH_E" "$SHARE/skills/" "$TARGET:.local/share/cc-tunnel/stage/skills/"
+  output=$(ssh_do "CC_TUNNEL_MAC_USER=$(q "$(id -un)") CC_TUNNEL_MAC_BIN=$(q "$BIN_DIR") \
+    CC_TUNNEL_MAC_CONFIG_DIR=$(q "$CONFIG_DIR") CC_TUNNEL_MAC_PATH=$(q "$(mac_path)") \
+    CC_TUNNEL_TUNNEL_PORT=$(q "$TUNNEL_PORT") CC_TUNNEL_AGENT=$(q "$AGENT") \
+    bash -l .local/share/cc-tunnel/stage/remote/install.sh ${flags[*]:-}")
+  printf '%s\n' "$output" | grep -v '^PUBKEY ' || true
+  pubkey=$(printf '%s\n' "$output" | sed -n 's/^PUBKEY //p')
+  authorize_remote_key "$pubkey" "$yes"
+  if ! nc -z -G 3 127.0.0.1 "${CC_TUNNEL_LOCAL_SSH_PORT:-22}" >/dev/null 2>&1; then
+    note "nothing is listening on local ssh port ${CC_TUNNEL_LOCAL_SSH_PORT:-22}: turn on Remote Login"
+    note "(System Settings > General > Sharing > Remote Login)"
+  fi
+  echo "next: cc-tunnel tunnel start, then in a project: cc-tunnel map && cc-tunnel check"
+}
+
+launch() {
+  local sync=1 command arg
+  if [[ "${1:-}" == "--no-sync" ]]; then sync=0; shift; fi
+  [[ "${CC_TUNNEL_SYNC:-1}" == 0 ]] && sync=0
+  require_mapping
+  require_remote
+  if [[ "$sync" -eq 1 ]]; then
+    note "syncing memory and project rules"
+    cmd_sync >/dev/null
+  fi
+  # mkdir -p: a session started in a subdirectory needs that path to exist in
+  # the remote stub, even though nothing but the agent's own state lives there.
+  command="mkdir -p $(q "$remote_dir") && cd $(q "$remote_dir") && export TERM=\${CC_TUNNEL_REMOTE_TERM:-xterm-256color} && exec $AGENT"
+  for arg in "$@"; do
+    command+=" $(q "$arg")"
+  done
+  exec ssh -tt "${SSH_TTY_OPTS[@]}" "$TARGET" "bash -lc $(q "$command")"
+}
+
+case "${1:-}" in
+  help|-h|--help) usage ;;
+  version|--version) echo "cc-tunnel $VERSION" ;;
+  map) shift; cmd_map "$@" ;;
+  mappings) cmd_mappings ;;
+  check|--check) cmd_check ;;
+  sync|context-sync) cmd_sync ;;
+  session) shift; cmd_session "$@" ;;
+  tunnel) shift; cmd_tunnel "$@" ;;
+  remote-setup) shift; cmd_remote_setup "$@" ;;
+  *) launch "$@" ;;
+esac

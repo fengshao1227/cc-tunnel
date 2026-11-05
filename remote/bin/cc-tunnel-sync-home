@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# SessionEnd hook: push this project's memory back to the local machine.
+#
+# Memory otherwise moves only when `cc-tunnel` starts a session, so everything
+# written during a remote session would sit here until the *next* one - and a
+# local agent picking up in between would see a stale picture.
+#
+# Never fails a session: an unmapped directory or an unreachable machine exits
+# 0. A hook that can break a session over bookkeeping is worse than one that
+# occasionally does nothing.
+set -uo pipefail
+# shellcheck source=/dev/null
+. "${CC_TUNNEL_REMOTE_ENV:-$HOME/.config/cc-tunnel/remote.env}" 2>/dev/null || exit 0
+
+project_dir=${CLAUDE_PROJECT_DIR:-$(pwd -P)}
+ssh_mac=(ssh -n -F "$HOME/.ssh/config" cc-tunnel-mac)
+
+# The mapping is read from the local machine's own file at run time. A copy
+# kept here would silently miss every project added after it was written.
+mapping=$("${ssh_mac[@]}" "cat $(printf '%q' "$CC_TUNNEL_MAC_CONFIG_DIR/projects.conf")" 2>/dev/null) || exit 0
+
+local_root='' best=''
+while IFS='|' read -r mapped_local mapped_remote _rest; do
+  [[ -z "${mapped_local:-}" || "$mapped_local" == \#* ]] && continue
+  mapped_remote=${mapped_remote%$'\r'}
+  [[ -n "$mapped_remote" ]] || continue
+  if [[ "$project_dir" == "$mapped_remote" || "$project_dir" == "$mapped_remote"/* ]]; then
+    if [[ ${#mapped_remote} -ge ${#best} ]]; then
+      best=$mapped_remote
+      local_root=$mapped_local
+    fi
+  fi
+done <<< "$mapping"
+
+[[ -n "$local_root" ]] || exit 0
+
+# Detached: a full sync takes several seconds, and a session should not wait
+# for a background chore before it can exit.
+"${ssh_mac[@]}" "cd $(printf '%q' "$local_root") && $(printf '%q' "$CC_TUNNEL_MAC_BIN/cc-tunnel") sync" \
+  >/dev/null 2>&1 &
+exit 0

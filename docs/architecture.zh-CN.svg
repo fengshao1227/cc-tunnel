@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="48%" r="52%">
+      <stop offset="0%" stop-color="#0E7490" stop-opacity="0.30"/>
+      <stop offset="65%" stop-color="#070B16" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="pipe" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#1D4ED8" stop-opacity="0.20"/>
+      <stop offset="50%" stop-color="#0891B2" stop-opacity="0.08"/>
+      <stop offset="100%" stop-color="#15803D" stop-opacity="0.20"/>
+    </linearGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1E293B" stroke-opacity="0.45" stroke-width="1"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#22D3EE"/>
+    </marker>
+    <marker id="arrowP" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#C084FC"/>
+    </marker>
+    <style>
+      .cn   { font-family: "PingFang SC", "Hiragino Sans GB", "Heiti SC", sans-serif; }
+      .mono { font-family: "SF Mono", Menlo, Monaco, monospace; }
+    </style>
+  </defs>
+
+  <!-- background -->
+  <rect width="1600" height="900" fill="#070B16"/>
+  <rect width="1600" height="900" fill="url(#grid)"/>
+  <rect width="1600" height="900" fill="url(#glow)"/>
+
+  <!-- header -->
+  <text x="72" y="82" class="mono" font-size="18" fill="#64748B" letter-spacing="3">CC-TUNNEL</text>
+  <text x="72" y="140" class="cn" font-size="54" font-weight="700" fill="#F8FAFC">代码只在 <tspan fill="#4ADE80">Mac</tspan> 上，Claude 跑在 <tspan fill="#60A5FA">VPS</tspan> 上</text>
+  <text x="72" y="184" class="cn" font-size="24" fill="#94A3B8">一条反向 SSH 隧道 + MCP —— VPS 上不放代码镜像，所有读写都落在 Mac 那一份上</text>
+
+  <!-- VPS box -->
+  <rect x="72" y="222" width="372" height="402" rx="22" fill="#0D1530" stroke="#3B82F6" stroke-opacity="0.75" stroke-width="2"/>
+  <text x="104" y="282" class="mono" font-size="40" font-weight="700" fill="#60A5FA">VPS</text>
+  <rect x="200" y="253" width="92" height="34" rx="17" fill="#1E3A8A" fill-opacity="0.6"/>
+  <text x="246" y="276" class="cn" font-size="18" fill="#BFDBFE" text-anchor="middle">控制面</text>
+
+  <circle cx="112" cy="326" r="5" fill="#60A5FA"/>
+  <text x="130" y="334" class="cn" font-size="23" fill="#E2E8F0">Claude Code 会话</text>
+  <circle cx="112" cy="372" r="5" fill="#60A5FA"/>
+  <text x="130" y="380" class="cn" font-size="23" fill="#E2E8F0">模型请求 · Agent 循环</text>
+  <circle cx="112" cy="418" r="5" fill="#60A5FA"/>
+  <text x="130" y="426" class="cn" font-size="23" fill="#E2E8F0">记忆 · 会话记录</text>
+
+  <circle cx="112" cy="464" r="5" fill="#60A5FA"/>
+  <text x="130" y="472" class="cn" font-size="23" fill="#E2E8F0">文档 · 联网搜索 MCP</text>
+
+  <line x1="104" y1="506" x2="412" y2="506" stroke="#1E293B" stroke-width="2"/>
+  <g stroke="#F87171" stroke-width="3.5" stroke-linecap="round">
+    <line x1="104" y1="535" x2="122" y2="553"/>
+    <line x1="122" y1="535" x2="104" y2="553"/>
+  </g>
+  <text x="136" y="553" class="cn" font-size="26" font-weight="700" fill="#FCA5A5">不放代码镜像</text>
+  <text x="104" y="591" class="cn" font-size="18" fill="#64748B">副本一定会过期，干脆不要</text>
+
+  <!-- Mac box -->
+  <rect x="1156" y="222" width="372" height="402" rx="22" fill="#0A1912" stroke="#22C55E" stroke-opacity="0.75" stroke-width="2"/>
+  <text x="1188" y="282" class="mono" font-size="40" font-weight="700" fill="#4ADE80">Mac</text>
+  <rect x="1284" y="253" width="124" height="34" rx="17" fill="#14532D" fill-opacity="0.7"/>
+  <text x="1346" y="276" class="cn" font-size="18" fill="#BBF7D0" text-anchor="middle">唯一真相源</text>
+
+  <circle cx="1196" cy="326" r="5" fill="#4ADE80"/>
+  <text x="1214" y="334" class="cn" font-size="23" fill="#E2E8F0">源码 · Git 仓库</text>
+  <circle cx="1196" cy="372" r="5" fill="#4ADE80"/>
+  <text x="1214" y="380" class="cn" font-size="23" fill="#E2E8F0">build · test · docker</text>
+  <circle cx="1196" cy="418" r="5" fill="#4ADE80"/>
+  <text x="1214" y="426" class="cn" font-size="23" fill="#E2E8F0">ripgrep · CodeGraph</text>
+  <circle cx="1196" cy="464" r="5" fill="#4ADE80"/>
+  <text x="1214" y="472" class="cn" font-size="23" fill="#E2E8F0">Codex · 本地 Agent</text>
+
+  <line x1="1188" y1="506" x2="1496" y2="506" stroke="#1E293B" stroke-width="2"/>
+  <rect x="1188" y="539" width="20" height="15" rx="3" fill="#FBBF24"/>
+  <path d="M1192 539 v-5 a6 6 0 0 1 12 0 v5" fill="none" stroke="#FBBF24" stroke-width="3"/>
+  <text x="1218" y="554" class="cn" font-size="22" font-weight="700" fill="#FDE68A">.env · 密钥 · git 凭据</text>
+  <text x="1188" y="591" class="cn" font-size="18" fill="#64748B">不会被复制到 VPS</text>
+
+  <!-- tunnel -->
+  <rect x="468" y="244" width="664" height="360" rx="30" fill="url(#pipe)" stroke="#22D3EE" stroke-opacity="0.38" stroke-width="2" stroke-dasharray="10 8"/>
+  <text x="800" y="284" class="cn" font-size="26" font-weight="700" fill="#67E8F9" text-anchor="middle">反向 SSH 隧道</text>
+  <text x="800" y="312" class="cn" font-size="17" fill="#64748B" text-anchor="middle">Mac 主动连出 · 不需要公网 IP · launchd 守护</text>
+
+  <!-- MCP lanes: VPS calls, Mac executes -->
+  <g>
+    <line x1="446" y1="362" x2="1150" y2="362" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="608" y="342" width="384" height="40" rx="20" fill="#081322" stroke="#22D3EE" stroke-opacity="0.5"/>
+    <text x="800" y="369" text-anchor="middle" font-size="20"><tspan class="mono" fill="#67E8F9">workspace</tspan><tspan class="cn" fill="#CBD5E1" dx="12">读 · 搜 · 改 · 执行</tspan></text>
+  </g>
+  <g>
+    <line x1="446" y1="428" x2="1150" y2="428" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="608" y="408" width="384" height="40" rx="20" fill="#081322" stroke="#22D3EE" stroke-opacity="0.5"/>
+    <text x="800" y="435" text-anchor="middle" font-size="20"><tspan class="mono" fill="#67E8F9">codegraph</tspan><tspan class="cn" fill="#CBD5E1" dx="12">调用链 · 影响面</tspan></text>
+  </g>
+  <g>
+    <line x1="446" y1="494" x2="1150" y2="494" stroke="#22D3EE" stroke-opacity="0.6" stroke-width="2.5" marker-end="url(#arrow)"/>
+    <rect x="608" y="474" width="384" height="40" rx="20" fill="#081322" stroke="#22D3EE" stroke-opacity="0.5"/>
+    <text x="800" y="501" text-anchor="middle" font-size="20"><tspan class="mono" fill="#67E8F9">fast-context</tspan><tspan class="cn" fill="#CBD5E1" dx="12">自然语言搜代码</tspan></text>
+  </g>
+
+  <!-- memory lane: two-way, not MCP -->
+  <g>
+    <line x1="450" y1="562" x2="1150" y2="562" stroke="#C084FC" stroke-opacity="0.7" stroke-width="2.5" stroke-dasharray="7 6" marker-start="url(#arrowP)" marker-end="url(#arrowP)"/>
+    <rect x="608" y="542" width="384" height="40" rx="20" fill="#120A22" stroke="#C084FC" stroke-opacity="0.55"/>
+    <text x="800" y="569" text-anchor="middle" font-size="20"><tspan class="mono" fill="#D8B4FE">cc-tunnel sync</tspan><tspan class="cn" fill="#CBD5E1" dx="12">双向同步规则与记忆</tspan></text>
+  </g>
+
+  <!-- terminal card -->
+  <rect x="72" y="652" width="560" height="196" rx="18" fill="#04070D" stroke="#1E293B" stroke-width="2"/>
+  <circle cx="100" cy="680" r="6" fill="#F87171"/>
+  <circle cx="122" cy="680" r="6" fill="#FBBF24"/>
+  <circle cx="144" cy="680" r="6" fill="#34D399"/>
+  <text x="352" y="686" class="cn" font-size="15" fill="#475569" text-anchor="middle">Mac 终端 · 任意已映射的项目</text>
+  <text x="100" y="746" class="mono" font-size="32" font-weight="700"><tspan fill="#64748B">$ </tspan><tspan fill="#4ADE80">cc-tunnel</tspan></text>
+  <text x="100" y="794" class="cn" font-size="20" fill="#CBD5E1">映射目录 · 同步记忆 · 打开 VPS 上的 Claude</text>
+  <text x="100" y="826" class="cn" font-size="17" fill="#64748B">一条命令进入工作区，MCP 随 Claude 进程自动加载</text>
+
+  <!-- stat cards -->
+  <rect x="660" y="652" width="272" height="196" rx="18" fill="#0D1530" stroke="#1E293B" stroke-width="2"/>
+  <text x="688" y="738" class="mono" font-size="60" font-weight="800" fill="#67E8F9">~16<tspan font-size="28" dx="8">ms</tspan></text>
+  <text x="688" y="784" class="cn" font-size="20" fill="#E2E8F0">连接建好后读一次文件</text>
+  <text x="688" y="816" class="cn" font-size="16" fill="#64748B">隧道 RTT 每个会话只付一次</text>
+
+  <rect x="958" y="652" width="272" height="196" rx="18" fill="#0D1530" stroke="#1E293B" stroke-width="2"/>
+  <text x="986" y="738" class="mono" font-size="60" font-weight="800" fill="#4ADE80">14<tspan font-size="28" dx="8">s</tspan></text>
+  <text x="986" y="784" class="cn" font-size="20" fill="#E2E8F0">隧道被杀掉后自动恢复</text>
+  <text x="986" y="816" class="cn" font-size="16" fill="#64748B">实测 <tspan class="mono">kill -9</tspan> · launchd 守护</text>
+
+  <rect x="1256" y="652" width="272" height="196" rx="18" fill="#0D1530" stroke="#1E293B" stroke-width="2"/>
+  <text x="1284" y="738" class="mono" font-size="60" font-weight="800" fill="#60A5FA">1<tspan class="cn" font-size="28" dx="8">份</tspan></text>
+  <text x="1284" y="784" class="cn" font-size="20" fill="#E2E8F0">所有 Agent 读写同一份</text>
+  <text x="1284" y="816" class="cn" font-size="16" fill="#64748B">读到的就是正在改的那份</text>
+
+  <!-- footer -->
+  <text x="72" y="882" class="mono" font-size="15" fill="#334155">cc-tunnel</text>
+  <text x="1528" y="882" class="cn" font-size="18" fill="#94A3B8" text-anchor="end">Agent 去找代码，而不是把代码搬给 Agent</text>
+</svg>

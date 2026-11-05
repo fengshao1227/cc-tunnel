@@ -1,0 +1,7 @@
+# local root | remote root [| local Claude records directory]
+#
+# One line per project. `cc-tunnel map` adds lines; remove one by deleting it.
+# The longest matching prefix wins, on both sides, so a root can be a single
+# repository or a directory that holds several.
+#
+# /Users/you/code/app|/home/agent/projects/app

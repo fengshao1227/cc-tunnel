@@ -1,0 +1,65 @@
+#!/bin/bash
+# Keep the reverse SSH tunnel to the remote host alive. Run by launchd.
+#
+# The tunnel is what every remote capability rides on: the workspace MCP
+# server, codegraph, fast-context and memory sync all reach this machine through
+# 127.0.0.1:$CC_TUNNEL_TUNNEL_PORT on the remote host. This machine dials out, so
+# it needs no public IP and no port forwarded on the router.
+#
+# Idempotent on purpose: if a tunnel is already running - including one started
+# by hand - this exits quietly and lets launchd retry, so loading the agent never
+# fights a healthy link.
+set -u
+
+CONFIG_DIR=${CC_TUNNEL_CONFIG_DIR:-$HOME/.config/cc-tunnel}
+if [[ -r "$CONFIG_DIR/config" ]]; then
+  # shellcheck source=/dev/null
+  . "$CONFIG_DIR/config"
+fi
+
+: "${CC_TUNNEL_REMOTE_HOST:?set CC_TUNNEL_REMOTE_HOST in $CONFIG_DIR/config}"
+: "${CC_TUNNEL_TUNNEL_USER:?set CC_TUNNEL_TUNNEL_USER in $CONFIG_DIR/config}"
+TUNNEL_PORT=${CC_TUNNEL_TUNNEL_PORT:-22022}
+LOCAL_SSH_PORT=${CC_TUNNEL_LOCAL_SSH_PORT:-22}
+KEY=${CC_TUNNEL_TUNNEL_KEY:-}
+KEY=${KEY/#\~/$HOME}
+
+# Only real ssh processes are inspected. A plain `pgrep -f` on the forward
+# string also matches any shell whose command line happens to contain it -
+# including the one that launched this check - and reports a live tunnel when
+# there is none.
+tunnel_alive() {
+  local pid
+  for pid in $(/usr/bin/pgrep -x ssh 2>/dev/null); do
+    if /bin/ps -o command= -p "$pid" 2>/dev/null \
+       | /usr/bin/grep -q -- "-R 127.0.0.1:${TUNNEL_PORT}:"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+if tunnel_alive; then
+  sleep 30
+  exit 0
+fi
+
+options=(-N -R "127.0.0.1:${TUNNEL_PORT}:127.0.0.1:${LOCAL_SSH_PORT}"
+  -o BatchMode=yes
+  -o ExitOnForwardFailure=yes
+  -o StrictHostKeyChecking=accept-new
+  # 90 s of silence ends the process; launchd (KeepAlive) starts a fresh one.
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=3)
+# Only what is set is passed, so a Host alias in ~/.ssh/config keeps its own
+# Port and IdentityFile instead of being silently overridden.
+[[ -n "${CC_TUNNEL_REMOTE_PORT:-}" ]] && options+=(-p "$CC_TUNNEL_REMOTE_PORT")
+[[ -n "$KEY" ]] && options+=(-i "$KEY" -o IdentitiesOnly=yes)
+# Extra options, e.g. "-o BindInterface=en0" to keep the tunnel off a local
+# TUN-mode proxy (see docs/troubleshooting.md).
+if [[ -n "${CC_TUNNEL_SSH_OPTS:-}" ]]; then
+  read -r -a extra <<< "$CC_TUNNEL_SSH_OPTS"
+  options+=("${extra[@]}")
+fi
+
+exec /usr/bin/ssh "${options[@]}" "${CC_TUNNEL_TUNNEL_USER}@${CC_TUNNEL_REMOTE_HOST}"

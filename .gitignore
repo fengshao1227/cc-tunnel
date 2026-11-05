@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.DS_Store
+# Your real configuration never belongs here.
+config/config
+config/projects.conf

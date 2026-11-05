@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+"""cc-tunnel workspace gateway: a stdio MCP server for one local project root.
+
+The remote agent never holds a copy of the code. Every read, search, edit and
+command it makes on a mapped project arrives here, over the reverse tunnel, and
+runs against the one tree on this machine.
+
+Every byte a tool returns lands in the calling model's context, so results are
+plain text, paths are relative to the root, and each output has a budget that
+says so when it is hit. Edits are applied to a file's current bytes, keep its
+mode and line endings, and never need the caller to have read the whole file.
+
+Standard library only, and Python 3.8+: this runs under whatever `python3` a
+non-interactive SSH session finds first, which on macOS is /usr/bin/python3
+(3.9), not the newer one an interactive shell would pick.
+"""
+import argparse
+import fnmatch
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from typing import Any, Dict, List, Optional
+
+VERSION = "0.1.0"
+
+READ_DEFAULT_LINES = 600
+READ_MAX_LINE_CHARS = 1000
+FIND_DEFAULT_RESULTS = 100
+FIND_MAX_RESULTS = 500
+FIND_MAX_COLUMNS = 300
+EXEC_DEFAULT_OUTPUT = 12000
+EXEC_MAX_OUTPUT = 60000
+JOB_DEFAULT_OUTPUT = 4000
+SHA_PREFIX = 16
+
+# Names refused by every file tool *and* excluded from search. Matched against
+# each path component with fnmatch. Extend with CC_TUNNEL_SENSITIVE="a,b*,c".
+#
+# This is an accident barrier, not a containment boundary: workspace_exec runs
+# arbitrary commands and can read any of these. See docs/security.md.
+DEFAULT_SENSITIVE = (
+    ".env", ".env.*", ".git-credentials", ".netrc", ".npmrc", ".pypirc",
+    ".gitlab-token", ".deploy-keys", "id_rsa", "id_ecdsa", "id_ed25519",
+)
+
+CACHE_DIR = pathlib.Path(os.environ.get("XDG_CACHE_HOME", str(pathlib.Path.home() / ".cache"))) / "cc-tunnel"
+JOB_DIR = CACHE_DIR / "jobs"
+LOCK_DIR = CACHE_DIR / "locks"
+
+
+def sensitive_patterns() -> List[str]:
+    extra = [p.strip() for p in os.environ.get("CC_TUNNEL_SENSITIVE", "").split(",") if p.strip()]
+    return list(DEFAULT_SENSITIVE) + extra
+
+
+def clip_output(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    head = limit // 4
+    tail = limit - head
+    omitted = len(text) - head - tail
+    return (text[:head] + f"\n[... {omitted} chars omitted; filter the command (grep/head/cut) "
+            f"or pass max_output_chars (max {EXEC_MAX_OUTPUT}) ...]\n" + text[-tail:])
+
+
+def clip_line(line: str) -> str:
+    if len(line) <= READ_MAX_LINE_CHARS:
+        return line
+    return line[:READ_MAX_LINE_CHARS] + f" ...[+{len(line) - READ_MAX_LINE_CHARS} chars]"
+
+
+def bounded(args: Dict[str, Any], key: str, default: int, low: int, high: int) -> int:
+    return min(high, max(low, int(args.get(key, default))))
+
+
+def decode_output(value: Any) -> str:
+    if value is None:
+        return ""
+    return value.decode("utf-8", "replace") if isinstance(value, bytes) else value
+
+
+def find_rg() -> str:
+    # A non-interactive SSH session has a minimal PATH, so Homebrew's rg is
+    # invisible to shutil.which unless it is looked for by name.
+    for candidate in (shutil.which("rg"), "/opt/homebrew/bin/rg", "/usr/local/bin/rg"):
+        if candidate and pathlib.Path(candidate).exists():
+            return candidate
+    raise RuntimeError("ripgrep (rg) is not installed on this machine; workspace_find needs it")
+
+
+class Workspace:
+    def __init__(self, root: str):
+        self.root = pathlib.Path(root).expanduser().resolve()
+        # Never create the root. A wrong path from the router should fail
+        # loudly, not quietly mint an empty directory and "work" in it.
+        if not self.root.is_dir():
+            raise SystemExit(f"cc-tunnel-mcp: workspace root does not exist: {self.root}")
+        self.sensitive = sensitive_patterns()
+        self.lock_handle = None
+        self.lock_path = LOCK_DIR / (hashlib.sha256(str(self.root).encode()).hexdigest()[:16] + ".lock")
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+
+    def is_sensitive(self, path: pathlib.Path) -> bool:
+        return any(fnmatch.fnmatch(part, pattern) for part in path.parts for pattern in self.sensitive)
+
+    def path(self, value: str) -> pathlib.Path:
+        candidate = (self.root / value).resolve() if not os.path.isabs(value) else pathlib.Path(value).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError:
+            raise ValueError("path is outside the workspace root")
+        if self.is_sensitive(candidate.relative_to(self.root)):
+            raise ValueError("sensitive paths are not exposed through the workspace gateway")
+        return candidate
+
+    def rel(self, path: pathlib.Path) -> str:
+        try:
+            return str(path.relative_to(self.root)) or "."
+        except ValueError:
+            return str(path)
+
+    def digest(self, path: pathlib.Path) -> str:
+        h = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def check_expected(self, path: pathlib.Path, expected: Any, action: str) -> None:
+        # The full hash or the prefix workspace_read prints both count.
+        if not expected or not path.exists():
+            return
+        actual = self.digest(path)
+        if len(str(expected)) < 8 or not actual.startswith(str(expected)):
+            raise ValueError(f"{action} refused: {self.rel(path)} changed since it was read "
+                             f"(sha256 now {actual[:SHA_PREFIX]})")
+
+    def text_of(self, path: pathlib.Path) -> str:
+        if not path.is_file():
+            raise ValueError(f"file does not exist: {self.rel(path)}")
+        try:
+            return path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError(f"{self.rel(path)} is not UTF-8 text")
+
+    def atomic_write(self, path: pathlib.Path, content: str) -> None:
+        # Keep the mode of the file being replaced: a temp file is born 0600,
+        # and replacing a script with it used to drop its executable bit.
+        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o644
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".cc-tunnel-", dir=str(path.parent))
+        try:
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(content.encode("utf-8"))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temporary, mode)
+            os.replace(temporary, path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    # ---- lease -----------------------------------------------------------
+
+    def guard_write(self) -> None:
+        """Refuse a write while another session holds the workspace lock.
+
+        The lock used to be advisory: a second agent was correctly refused the
+        lock and its write then succeeded anyway. Now a write checks for a
+        holder first. Taking the lock stays optional - an agent that never
+        takes it can still write while nobody holds it.
+        """
+        import fcntl
+        if self.lock_handle or not self.lock_path.exists():
+            return
+        with self.lock_path.open("a+") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                probe.seek(0)
+                holder = probe.read().strip() or "another agent"
+                raise ValueError(f"workspace is locked by {holder}; wait, or coordinate before writing")
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+
+    def lock(self, args: Dict[str, Any]) -> str:
+        import fcntl
+        if self.lock_handle:
+            return "workspace lock already held by this MCP session"
+        LOCK_DIR.mkdir(parents=True, exist_ok=True)
+        handle = self.lock_path.open("a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            holder = handle.read().strip() or "another agent"
+            handle.close()
+            raise ValueError(f"workspace is locked by {holder}")
+        os.ftruncate(handle.fileno(), 0)
+        handle.write(json.dumps({"pid": os.getpid(), "reason": args.get("reason", "")}))
+        handle.flush()
+        # Released by unlock, or by the kernel when this process exits - so a
+        # crashed agent cannot leave the workspace locked.
+        self.lock_handle = handle
+        return "workspace lock acquired; writes from other sessions are refused until unlock"
+
+    def unlock(self) -> str:
+        import fcntl
+        if not self.lock_handle:
+            return "workspace lock was not held by this MCP session"
+        os.ftruncate(self.lock_handle.fileno(), 0)
+        fcntl.flock(self.lock_handle.fileno(), fcntl.LOCK_UN)
+        self.lock_handle.close()
+        self.lock_handle = None
+        return "workspace lock released"
+
+    # ---- tools -----------------------------------------------------------
+
+    def read(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        if not path.is_file():
+            raise ValueError(f"file does not exist: {self.rel(path)}")
+        lines = path.read_bytes().decode("utf-8", "replace").splitlines()
+        total = len(lines)
+        # offset/limit are the names agents know from their own Read tool.
+        ranged = any(key in args for key in ("start_line", "end_line", "offset", "limit"))
+        start = max(1, int(args.get("start_line", args.get("offset", 1)) or 1))
+        if "end_line" in args:
+            end = int(args["end_line"])
+        elif "limit" in args:
+            end = start + int(args["limit"]) - 1
+        else:
+            end = start + READ_DEFAULT_LINES - 1
+        end = min(total, end)
+        body = "\n".join(f"{i}: {clip_line(lines[i - 1])}" for i in range(start, end + 1))
+        header = f"{self.rel(path)} sha256:{self.digest(path)[:SHA_PREFIX]} lines {start}-{end} of {total}"
+        if end < total and not ranged:
+            header += f" (first {READ_DEFAULT_LINES} only; pass start_line/end_line for the rest)"
+        return header + "\n" + body
+
+    def find(self, args: Dict[str, Any]) -> str:
+        pattern = args.get("pattern", "")
+        scope = self.rel(self.path(args.get("path", ".")))
+        limit = bounded(args, "max_results", FIND_DEFAULT_RESULTS, 1, FIND_MAX_RESULTS)
+        command = [find_rg(), "--hidden", "--glob", "!.git/**"]
+        # Every name the file tools refuse is excluded here too. Before this,
+        # search excluded only .env*, so a content search could print the lines
+        # of a token file that workspace_read would have refused outright.
+        for name in self.sensitive:
+            command += ["--glob", "!" + name]
+        if args.get("files_only"):
+            # Name/path matching by glob, which searching contents cannot do.
+            command += ["--files", "--glob", pattern, scope]
+        else:
+            mode = args.get("output_mode", "content")
+            if args.get("ignore_case"):
+                command.append("--ignore-case")
+            if args.get("glob"):
+                command += ["--glob", str(args["glob"])]
+            if args.get("type"):
+                command += ["--type", str(args["type"])]
+            if mode == "files":
+                command.append("--files-with-matches")
+            elif mode == "count":
+                command.append("--count")
+            else:
+                command += ["--with-filename", "--line-number", "--max-columns", str(FIND_MAX_COLUMNS),
+                            "--max-columns-preview"]
+                context = bounded(args, "context", 0, 0, 20)
+                if context:
+                    command += ["--context", str(context)]
+            command += ["--regexp", pattern, scope]
+        # Run from the root with a relative scope, so every path comes back
+        # relative: an absolute prefix repeated on each line is pure cost.
+        result = subprocess.run(command, cwd=str(self.root), universal_newlines=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if result.returncode not in (0, 1):
+            raise RuntimeError(result.stderr.strip() or "rg failed")
+        matches = [line[2:] if line.startswith("./") else line for line in result.stdout.splitlines()]
+        if not matches:
+            return "(no matches)"
+        more = f"\n[... {len(matches) - limit} more lines; narrow pattern/path/glob ...]" if len(matches) > limit else ""
+        return "\n".join(matches[:limit]) + more
+
+    def write(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        self.guard_write()
+        self.check_expected(path, args.get("expected_sha256"), "write")
+        self.atomic_write(path, args.get("content", ""))
+        return f"wrote {self.rel(path)} sha256:{self.digest(path)[:SHA_PREFIX]}"
+
+    def patch(self, args: Dict[str, Any]) -> str:
+        path = self.path(args["path"])
+        self.guard_write()
+        self.check_expected(path, args.get("expected_sha256"), "patch")
+        content = self.text_of(path)
+        old, new = args["old_text"], args["new_text"]
+        if old == new:
+            raise ValueError("old_text and new_text are identical")
+        count = content.count(old)
+        if count == 0:
+            raise ValueError(f"old_text not found in {self.rel(path)}; re-read the lines you are replacing")
+        replace_all = bool(args.get("replace_all"))
+        if count > 1 and not replace_all:
+            raise ValueError(f"old_text matches {count} places in {self.rel(path)}; "
+                             "include surrounding lines to make it unique, or pass replace_all")
+        line = content[:content.index(old)].count("\n") + 1
+        # Applied to the file's current bytes, so changes others made elsewhere
+        # in it survive; expected_sha256 is only needed to refuse those too.
+        self.atomic_write(path, content.replace(old, new) if replace_all else content.replace(old, new, 1))
+        done = count if replace_all else 1
+        return (f"patched {self.rel(path)}: {done} replacement(s), first at line {line}; "
+                f"sha256:{self.digest(path)[:SHA_PREFIX]}")
+
+    def exec_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        # Same minimal-PATH problem as rg: name the usual toolchain locations,
+        # plus whatever the user adds with CC_TUNNEL_EXEC_PATH.
+        extra = os.environ.get("CC_TUNNEL_EXEC_PATH", "")
+        env["PATH"] = ":".join(p for p in (extra, "/opt/homebrew/bin", "/usr/local/bin", env.get("PATH", "")) if p)
+        return env
+
+    def execute(self, args: Dict[str, Any]) -> str:
+        cwd = self.path(args.get("cwd", "."))
+        env = self.exec_env()
+        if args.get("background"):
+            return self.start_job(args["command"], cwd, env)
+        timeout = bounded(args, "timeout_seconds", 120, 1, 600)
+        limit = bounded(args, "max_output_chars", EXEC_DEFAULT_OUTPUT, 1000, EXEC_MAX_OUTPUT)
+        try:
+            result = subprocess.run(["/bin/bash", "-lc", args["command"]], cwd=str(cwd), env=env,
+                                    universal_newlines=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            # What it printed before the deadline is still worth having. The
+            # command may also have finished its side effect: say so, because a
+            # retried `git push` or migration runs twice.
+            return (f"timed out after {timeout}s (raise timeout_seconds up to 600, or pass background=true). "
+                    "It may still have had its effect - check before retrying anything that changes state.\n"
+                    + clip_output(decode_output(exc.stdout), limit))
+        return f"exit: {result.returncode}\n" + clip_output(result.stdout, limit)
+
+    def start_job(self, command: str, cwd: pathlib.Path, env: Dict[str, str]) -> str:
+        JOB_DIR.mkdir(parents=True, exist_ok=True)
+        job_id = uuid.uuid4().hex[:8]
+        log = JOB_DIR / f"{job_id}.log"
+        with log.open("wb") as handle:
+            process = subprocess.Popen(["/bin/bash", "-lc", command], cwd=str(cwd), env=env,
+                                       stdin=subprocess.DEVNULL, stdout=handle,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+        self.jobs[job_id] = {"process": process, "log": log, "command": command, "started": time.time()}
+        return f"job {job_id} started (pid {process.pid}); check it with workspace_job id={job_id}"
+
+    def job(self, args: Dict[str, Any]) -> str:
+        job_id = args.get("id")
+        if not job_id:
+            if not self.jobs:
+                return "(no jobs in this session)"
+            rows = []
+            for key, job in self.jobs.items():
+                code = job["process"].poll()
+                state = "running" if code is None else f"exit {code}"
+                rows.append(f"{key} {state} {int(time.time() - job['started'])}s {job['command'][:80]}")
+            return "\n".join(rows)
+        job = self.jobs.get(job_id)
+        if not job:
+            raise ValueError(f"no job {job_id} in this session")
+        process = job["process"]
+        wait = bounded(args, "wait_seconds", 0, 0, 600)
+        if wait:
+            try:
+                process.wait(timeout=wait)
+            except subprocess.TimeoutExpired:
+                pass
+        if args.get("kill") and process.poll() is None:
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+        code = process.poll()
+        state = "running" if code is None else f"exit {code}"
+        output = job["log"].read_bytes().decode("utf-8", "replace")
+        limit = bounded(args, "max_output_chars", JOB_DEFAULT_OUTPUT, 500, EXEC_MAX_OUTPUT)
+        head = f"job {job_id}: {state}, {int(time.time() - job['started'])}s, {len(output)} chars of output"
+        if len(output) > limit:
+            return head + f" (last {limit} shown)\n" + output[-limit:]
+        return head + "\n" + output
+
+    def status(self) -> str:
+        rows = [f"root: {self.root}"]
+        repos = [self.root] if (self.root / ".git").exists() else []
+        repos += [child for child in sorted(self.root.iterdir())
+                  if child.is_dir() and not child.name.startswith(".") and (child / ".git").exists()]
+        for repo in repos:
+            result = subprocess.run(["git", "status", "--short", "--branch"], cwd=str(repo),
+                                    universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            status = result.stdout.splitlines()
+            name = "." if repo == self.root else repo.name
+            rows.append(f"{name}: " + (status[0] if status else ""))
+            rows += ["  " + line for line in status[1:8]]
+            if len(status) > 8:
+                rows.append(f"  ... {len(status) - 8} more changed paths")
+        if self.lock_handle:
+            rows.append("lock: held by this session")
+        elif self.lock_path.exists() and self.lock_path.read_text().strip():
+            rows.append(f"lock: {self.lock_path.read_text().strip()} (may be stale if that process has exited)")
+        return "\n".join(rows)
+
+
+def schema(properties: Dict[str, Any], required=()) -> Dict[str, Any]:
+    return {"type": "object", "properties": properties, "required": list(required)}
+
+
+INT = {"type": "integer"}
+STR = {"type": "string"}
+BOOL = {"type": "boolean"}
+
+TOOLS = {
+    "workspace_status": {
+        "description": "Workspace root (the local absolute path), the git branch/status of the root and of each "
+                       "repository directly inside it, and who holds the write lock. Call this first: codegraph "
+                       "and fast-context need that absolute root as their project path.",
+        "inputSchema": schema({})},
+    "workspace_read": {
+        "description": "Read a text file, like Read. Paths are relative to the workspace root (e.g. 'src/app.py'). "
+                       "Returns numbered lines and a 16-char sha256 prefix. Without a range: the first 600 lines. "
+                       "For bigger files find the spot with workspace_find, then read just that range with "
+                       "start_line/end_line (offset/limit also accepted). Lines over 1000 chars are cut.",
+        "inputSchema": schema({"path": STR,
+                               "start_line": {"type": "integer", "description": "First line, 1-based."},
+                               "end_line": {"type": "integer", "description": "Last line, inclusive."},
+                               "offset": {"type": "integer", "description": "Alias of start_line."},
+                               "limit": {"type": "integer", "description": "Number of lines."}}, ["path"])},
+    "workspace_find": {
+        "description": "ripgrep over the workspace, like Grep. output_mode: content (path:line:text, default), "
+                       "files (matching paths only), count (matches per file). Scope with path (e.g. 'src'), glob "
+                       "('*.go') or type ('go'); ignore_case; context = lines around each match (max 20); "
+                       "max_results (default 100, max 500). files_only=true matches file names by glob instead, "
+                       "like Glob. Paths come back relative to the root; long lines are cut.",
+        "inputSchema": schema({"pattern": {"type": "string",
+                                           "description": "Regex over contents, or a glob such as '**/*.go' "
+                                                          "when files_only is true."},
+                               "path": STR, "output_mode": {"type": "string", "enum": ["content", "files", "count"]},
+                               "glob": STR, "type": STR, "ignore_case": BOOL, "context": INT, "max_results": INT,
+                               "files_only": BOOL}, ["pattern"])},
+    "workspace_patch": {
+        "description": "Edit a file, like Edit: replace old_text with new_text. old_text must match exactly once "
+                       "(include surrounding lines to make it unique) unless replace_all is true. The edit is "
+                       "applied to the file's current content, so changes others made elsewhere in it are kept. "
+                       "Keeps file mode and line endings. Refused while another session holds the workspace lock.",
+        "inputSchema": schema({"path": STR, "old_text": STR, "new_text": STR, "replace_all": BOOL,
+                               "expected_sha256": {"type": "string",
+                                                   "description": "Optional; full hash or the 16-char prefix. "
+                                                                  "Refuses if the file changed since."}},
+                              ["path", "old_text", "new_text"])},
+    "workspace_write": {
+        "description": "Create or overwrite a whole file, like Write. For an existing file pass expected_sha256 "
+                       "(full or the 16-char prefix from workspace_read) so a concurrent change is not "
+                       "overwritten; for edits prefer workspace_patch. Keeps the mode of a file it replaces. "
+                       "Refused while another session holds the workspace lock.",
+        "inputSchema": schema({"path": STR, "content": STR, "expected_sha256": STR}, ["path", "content"])},
+    "workspace_exec": {
+        "description": "Run a bash command in the workspace root (cwd to scope), like Bash. Calls run one at a "
+                       "time, so a slow command blocks every other call: pass background=true for anything over "
+                       "a minute (builds, full test runs) and follow it with workspace_job. timeout_seconds: "
+                       "default 120, max 600; on timeout the output so far is returned - and the command may "
+                       "still have taken effect, so check before retrying anything that changes state. Output "
+                       "over max_output_chars (default 12000, max 60000) keeps head and tail with a marker.",
+        "inputSchema": schema({"command": STR, "cwd": STR, "timeout_seconds": INT, "max_output_chars": INT,
+                               "background": BOOL}, ["command"])},
+    "workspace_job": {
+        "description": "Check a background workspace_exec job: state, elapsed time and the tail of its output "
+                       "(max_output_chars, default 4000). wait_seconds (max 600) first waits for it to finish, so "
+                       "one call can replace a polling loop; kill=true stops it. Without id: list this session's jobs.",
+        "inputSchema": schema({"id": STR, "wait_seconds": INT, "max_output_chars": INT, "kill": BOOL})},
+    "workspace_lock": {
+        "description": "Take the workspace write lease. While held, workspace_write and workspace_patch from every "
+                       "other session are refused. Released by workspace_unlock or when this session ends. "
+                       "Take it before a multi-file change another agent must not interleave with.",
+        "inputSchema": schema({"reason": STR})},
+    "workspace_unlock": {"description": "Release the workspace write lease.", "inputSchema": schema({})},
+}
+
+
+def respond(message: Dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(message, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+
+
+def handle(workspace: Workspace, handlers: Dict[str, Any], request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    method, request_id = request.get("method"), request.get("id")
+    if method == "initialize":
+        version = (request.get("params") or {}).get("protocolVersion", "2024-11-05")
+        return {"jsonrpc": "2.0", "id": request_id, "result": {
+            "protocolVersion": version, "capabilities": {"tools": {}},
+            "serverInfo": {"name": "cc-tunnel-workspace", "version": VERSION}}}
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": request_id,
+                "result": {"tools": [{"name": name, **spec} for name, spec in TOOLS.items()]}}
+    if method == "tools/call":
+        params = request.get("params") or {}
+        name, args = params.get("name"), params.get("arguments") or {}
+        if name not in handlers:
+            return {"jsonrpc": "2.0", "id": request_id,
+                    "error": {"code": -32602, "message": f"unknown tool: {name}"}}
+        try:
+            text, failed = str(handlers[name](args)), False
+        except Exception as exc:  # a tool failure is a result the model should see, not a protocol error
+            text, failed = f"error: {exc}", True
+        result = {"content": [{"type": "text", "text": text}]}
+        if failed:
+            result["isError"] = True
+        return {"jsonrpc": "2.0", "id": request_id, "result": result}
+    if request_id is None:  # notifications, e.g. notifications/initialized
+        return None
+    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="cc-tunnel workspace MCP server (stdio)")
+    parser.add_argument("--root", required=True, help="local project root this session may touch")
+    workspace = Workspace(parser.parse_args().root)
+    handlers = {
+        "workspace_status": lambda args: workspace.status(),
+        "workspace_read": workspace.read,
+        "workspace_find": workspace.find,
+        "workspace_patch": workspace.patch,
+        "workspace_write": workspace.write,
+        "workspace_exec": workspace.execute,
+        "workspace_job": workspace.job,
+        "workspace_lock": workspace.lock,
+        "workspace_unlock": lambda args: workspace.unlock(),
+    }
+    for line in sys.stdin:
+        if not line.strip():
+            continue
+        try:
+            request = json.loads(line)
+        except ValueError:
+            respond({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        try:
+            reply = handle(workspace, handlers, request)
+        except Exception as exc:
+            reply = {"jsonrpc": "2.0", "id": request.get("id"), "error": {"code": -32603, "message": str(exc)}}
+        if reply is not None:
+            respond(reply)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass

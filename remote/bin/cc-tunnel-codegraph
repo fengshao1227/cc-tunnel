@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Optional MCP server: CodeGraph running on the local machine, against the one
+# canonical tree. Callers, impact and structure come from the code being edited,
+# not from a copy.
+#
+# Its tools take an explicit absolute project path. Get it from
+# workspace_status: a wrong path (a sibling like app vs app-fix) fails silently.
+set -euo pipefail
+# shellcheck source=/dev/null
+. "${CC_TUNNEL_REMOTE_ENV:-$HOME/.config/cc-tunnel/remote.env}"
+
+# A non-interactive ssh session has a minimal PATH, so `#!/usr/bin/env node`
+# fails with "env: node: No such file or directory" unless the toolchain is
+# named. CC_TUNNEL_MAC_PATH is recorded by `cc-tunnel remote-setup`.
+exec ssh -F "$HOME/.ssh/config" cc-tunnel-mac \
+  "export PATH=$(printf '%q' "$CC_TUNNEL_MAC_PATH"):\$PATH; exec codegraph serve --mcp"
